@@ -41,6 +41,10 @@ struct Args {
     /// Listen for OSC messages on this UDP port (e.g. --osc-port 9000)
     #[arg(long)]
     osc_port: Option<u16>,
+
+    /// Start in fullscreen mode
+    #[arg(long, short = 'f')]
+    fullscreen: bool,
 }
 
 // All preprocessing logic is now in lib.rs
@@ -271,8 +275,14 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
+    game_width: u32,
+    game_height: u32,
     compute_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::RenderPipeline,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group: wgpu::BindGroup,
+    render_texture: wgpu::Texture,
+    render_texture_view: wgpu::TextureView,
     empty_bind_group: wgpu::BindGroup,
     compute_bind_group: wgpu::BindGroup,
     render_bind_group0: wgpu::BindGroup,
@@ -519,7 +529,7 @@ fn winit_key_index(key: &KeyCode) -> Option<usize> {
 
 impl State {
     async fn new(window: Arc<Window>, mut game_source: GameSource, entry_file: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let _size = window.inner_size();
+        let window_size = window.inner_size();
 
         // Initialize WebGPU
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -579,8 +589,8 @@ impl State {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: metadata.width,
-            height: metadata.height,
+            width: window_size.width,
+            height: window_size.height,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -1121,6 +1131,121 @@ impl State {
             }],
         });
 
+        // Create intermediate render texture at game resolution
+        let render_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Render Texture"),
+            size: wgpu::Extent3d {
+                width: metadata.width,
+                height: metadata.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let render_texture_view = render_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Create blit shader for copying to screen with letterboxing
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blit Shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                @group(0) @binding(0) var t_diffuse: texture_2d<f32>;
+                @group(0) @binding(1) var s_diffuse: sampler;
+
+                struct VertexOutput {
+                    @builtin(position) position: vec4f,
+                    @location(0) uv: vec2f,
+                }
+
+                @vertex
+                fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
+                    var out: VertexOutput;
+                    let x = f32((i << 1u) & 2u);
+                    let y = f32(i & 2u);
+                    out.position = vec4f(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+                    out.uv = vec2f(x, y);
+                    return out;
+                }
+
+                @fragment
+                fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+                    return textureSample(t_diffuse, s_diffuse, in.uv);
+                }
+            "#.into()),
+        });
+
+        let blit_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Blit Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Blit Pipeline Layout"),
+            bind_group_layouts: &[&blit_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blit Pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blit Bind Group"),
+            layout: &blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&render_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
         Ok(Self {
             window,
             title: metadata.title.clone(),
@@ -1128,9 +1253,15 @@ impl State {
             device,
             queue,
             config,
-            size: winit::dpi::PhysicalSize::new(metadata.width, metadata.height),
+            size: window_size,
+            game_width: metadata.width,
+            game_height: metadata.height,
             compute_pipeline,
             render_pipeline,
+            blit_pipeline,
+            blit_bind_group,
+            render_texture,
+            render_texture_view,
             empty_bind_group,
             compute_bind_group,
             render_bind_group0,
@@ -1209,8 +1340,24 @@ impl State {
                 true
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse[0] = position.x as f32;
-                self.mouse[1] = position.y as f32;
+                // Transform window coordinates to game coordinates with letterboxing
+                let content_aspect = self.game_width as f32 / self.game_height as f32;
+                let window_aspect = self.size.width as f32 / self.size.height as f32;
+                let (viewport_w, viewport_h, viewport_x, viewport_y) = if content_aspect > window_aspect {
+                    let h = self.size.width as f32 / content_aspect;
+                    let y = (self.size.height as f32 - h) * 0.5;
+                    (self.size.width as f32, h, 0.0, y)
+                } else {
+                    let w = self.size.height as f32 * content_aspect;
+                    let x = (self.size.width as f32 - w) * 0.5;
+                    (w, self.size.height as f32, x, 0.0)
+                };
+                
+                // Map window position to game coordinates
+                let rel_x = (position.x as f32 - viewport_x) / viewport_w;
+                let rel_y = (position.y as f32 - viewport_y) / viewport_h;
+                self.mouse[0] = rel_x * self.game_width as f32;
+                self.mouse[1] = rel_y * self.game_height as f32;
                 true
             }
             WindowEvent::MouseInput {
@@ -1331,7 +1478,7 @@ impl State {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output
+        let output_view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1353,12 +1500,12 @@ impl State {
             compute_pass.dispatch_workgroups(1, 1, 1);
         }
 
-        // Render
+        // Render to intermediate texture at game resolution
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: Some("Game Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.render_texture_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1391,6 +1538,44 @@ impl State {
                 3  // Fullscreen triangle
             };
             render_pass.draw(0..vertex_count, 0..1);
+        }
+
+        // Blit to screen with letterboxing
+        {
+            let mut blit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blit Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            // Calculate letterbox viewport
+            let content_aspect = self.game_width as f32 / self.game_height as f32;
+            let window_aspect = self.size.width as f32 / self.size.height as f32;
+            let (viewport_w, viewport_h, viewport_x, viewport_y) = if content_aspect > window_aspect {
+                // Content is wider - fit to width
+                let h = self.size.width as f32 / content_aspect;
+                let y = (self.size.height as f32 - h) * 0.5;
+                (self.size.width as f32, h, 0.0, y)
+            } else {
+                // Content is taller - fit to height
+                let w = self.size.height as f32 * content_aspect;
+                let x = (self.size.width as f32 - w) * 0.5;
+                (w, self.size.height as f32, x, 0.0)
+            };
+            blit_pass.set_viewport(viewport_x, viewport_y, viewport_w, viewport_h, 0.0, 1.0);
+
+            blit_pass.set_pipeline(&self.blit_pipeline);
+            blit_pass.set_bind_group(0, &self.blit_bind_group, &[]);
+            blit_pass.draw(0..3, 0..1);
         }
 
         // Copy audio buffer to staging for readback
@@ -2043,6 +2228,7 @@ struct App {
     hot_reload_rx: Option<std::sync::mpsc::Receiver<()>>,
     _watcher: Option<RecommendedWatcher>,
     osc_rx: Option<std::sync::mpsc::Receiver<OscMessage>>,
+    fullscreen: bool,
 }
 
 impl ApplicationHandler for App {
@@ -2050,22 +2236,35 @@ impl ApplicationHandler for App {
         if self.state.is_none() {
             let game_source = self.game_source.take().unwrap();
 
+            // Get primary monitor size for relative scaling
+            let scale = 0.8; // 80% of screen
+            let (width, height) = if let Some(monitor) = event_loop.primary_monitor() {
+                let size = monitor.size();
+                ((size.width as f32 * scale) as u32, (size.height as f32 * scale) as u32)
+            } else {
+                (800, 600)
+            };
+
             // Create window with metadata
             let window = Arc::new(
                 event_loop
                     .create_window(
                         winit::window::Window::default_attributes()
                             .with_title("WGSL Game")
-                            .with_inner_size(winit::dpi::PhysicalSize::new(800, 600)),
+                            .with_inner_size(winit::dpi::PhysicalSize::new(width, height)),
                     )
                     .unwrap(),
             );
 
             let state = pollster::block_on(State::new(window, game_source, &self.entry_file)).unwrap();
 
-            // Set window title and size from game metadata
+            // Set window title
             state.window.set_title(&state.title);
-            let _ = state.window.request_inner_size(state.size);
+
+            // Set fullscreen if requested
+            if self.fullscreen {
+                let _ = state.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
 
             self.state = Some(state);
         }
@@ -2077,6 +2276,23 @@ impl ApplicationHandler for App {
                 match event {
                     WindowEvent::CloseRequested => event_loop.exit(),
                     WindowEvent::Resized(physical_size) => state.resize(physical_size),
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                physical_key: PhysicalKey::Code(KeyCode::F11),
+                                state: ElementState::Pressed,
+                                ..
+                            },
+                        ..
+                    } => {
+                        // Toggle fullscreen
+                        let is_fullscreen = state.window.fullscreen().is_some();
+                        if is_fullscreen {
+                            let _ = state.window.set_fullscreen(None);
+                        } else {
+                            let _ = state.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                        }
+                    }
                     WindowEvent::RedrawRequested => {
                         state.update();
                         match state.render() {
@@ -2330,6 +2546,7 @@ fn main() {
         hot_reload_rx,
         _watcher,
         osc_rx,
+        fullscreen: args.fullscreen,
     };
     event_loop.run_app(&mut app).unwrap();
 }
